@@ -85,7 +85,7 @@ function hasVerificationEvidence(sessionText, claim, cfg) {
 }
 
 // src/index.ts
-var VERSION = "1.0.0";
+var VERSION = "1.0.1";
 function claudeDir() {
   const env = process.env.CLAUDE_CONFIG_DIR?.trim();
   if (env)

@@ -47,7 +47,7 @@ import {
 } from "./verify-cli"
 
 // Keep in sync with package.json on release.
-const VERSION = "1.0.0"
+const VERSION = "1.0.1"
 
 /** Claude Code config dir (~/.claude, or $CLAUDE_CONFIG_DIR). Resolved
  *  lazily so tests (and unusual environments) can point it elsewhere. */

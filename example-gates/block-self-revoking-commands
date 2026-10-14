@@ -126,7 +126,7 @@ RESTART_SAME_SEGMENT = re.compile(
 # the rule.
 DOC_WRITE = re.compile(
     r">>?\s*\S*(?:/memory/|/docs/|/tickets/|/runbooks/|/rules/)\S*|"
-    r">>?\s*\S+\.(?:md|markdown|txt|rst)\b"
+    r">>?\s*\S+\.(?:md|markdown|txt|rst|yaml|yml|json)\b"
 )
 
 # Searching FOR the string rather than running it.

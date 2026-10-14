@@ -1,6 +1,6 @@
 {
   "name": "opencode-safety-gates",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Safety gates for OpenCode: run your Claude Code PreToolUse bash-gate scripts inside OpenCode, deny self-revoking commands, and catch fabricated CLI syntax. Zero dependencies.",
   "type": "module",
   "license": "MIT",

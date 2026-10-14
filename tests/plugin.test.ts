@@ -472,6 +472,13 @@ describe("bundled example gate artifact", () => {
     const r = await runGate("echo 'systemctl stop sssd' >> post-mortem.md")
     expect(r.code).toBe(0)
   })
+
+  test.skipIf(!PY3)("allows quoting the command into a yaml/json config file (#v1.0.1)", async () => {
+    for (const f of ["awesome-plugins.yaml", "inventory.yml", "notes.json"]) {
+      const r = await runGate(`echo 'systemctl stop sssd' >> ${f}`)
+      expect(r.code).toBe(0)
+    }
+  })
 })
 
 describe("verify-cli pure functions", () => {
