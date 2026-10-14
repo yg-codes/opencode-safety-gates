@@ -1,0 +1,41 @@
+{
+  "name": "opencode-safety-gates",
+  "version": "1.0.0",
+  "description": "Safety gates for OpenCode: run your Claude Code PreToolUse bash-gate scripts inside OpenCode, deny self-revoking commands, and catch fabricated CLI syntax. Zero dependencies.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./plugin": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "example-gates",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "claude-code",
+    "hooks",
+    "pretooluse",
+    "security",
+    "bash-gate",
+    "agent-safety",
+    "llm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yg-codes/opencode-safety-gates.git"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --target=bun --format=esm --outfile=dist/index.js",
+    "test": "bun test",
+    "prepublishOnly": "bun run build && bun test"
+  },
+  "engines": {
+    "bun": ">=1.0"
+  }
+}

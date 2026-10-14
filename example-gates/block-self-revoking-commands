@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""PreToolUse (Bash) hook: deny commands that revoke the session's own access.
+
+An AI agent's shell session has no persistent channel back to the host: if a
+command destroys the service that carries the session's own authentication,
+nothing later in the same session can repair it — recovery becomes
+console-only, a channel an agent does not have.
+
+THE INCIDENT SHAPE THIS ENCODES (real, identifiers removed)
+  A three-command payload went out in one `ssh host 'bash -s'` heredoc:
+
+      systemctl stop sssd            -> SUCCEEDED
+      rm -f /var/lib/sss/db/cache_*  -> SUCCEEDED
+      systemctl start sssd           -> "user NOT in sudoers"   DENIED
+
+  Step 1 stopped the daemon serving the agent's own IPA sudo rights, so step 3
+  could not run. Worse, `sshd` on that host resolves authorized_keys through
+  `AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys` and NSS resolves the
+  account through SSSD, so key auth AND user resolution died with it.
+
+WHAT IT DENIES
+  Stopping/disabling/masking a service that the session's own access depends
+  on, and wiping the caches that back it:
+
+    sssd            IPA-served sudo + sss_ssh_authorizedkeys + NSS user lookup
+    sshd/ssh        the channel itself
+    NetworkManager  a re-activation can demote the management route and strand
+                    the management address while the host stays up
+    network         same, on older EL
+    firewalld       can strand the session; `iptables -F` likewise
+    nscd/oddjobd    identity-adjacent on enrolled hosts
+
+  `restart` is treated separately: a SINGLE atomic `systemctl restart <unit>`
+  is the sanctioned repair and is ALLOWED, because the unit comes back up in
+  the same command. What is denied is `stop` without a `start` in the same
+  segment, and any `stop`/`disable`/`mask` at all for sshd.
+
+WHY NOT "ban all non-read-only systemctl"
+  That over-blocks by a wide margin — restarting an application unit is
+  routine, approved work — and a hook that fires constantly gets disabled, at
+  which point it guards nothing. This hook therefore targets the MECHANISM
+  (self-revocation) rather than the verb (systemctl).
+
+WHAT IT MUST NOT DENY
+  - `systemctl restart sssd` — the sanctioned atomic repair.
+  - `systemctl status|is-active|is-enabled|show|cat|list-units` — read-only.
+  - Any stop/disable of a unit NOT on the access-critical list: an app, a
+    timer, a container, a logging agent...
+  - Reading or writing prose that quotes the banned form (rule files, ticket
+    notes, post-mortems, this hook). A post-mortem can quote
+    `systemctl stop sssd` verbatim, and writing it must not be blocked.
+  - Searching for the string (`rg 'systemctl stop sssd' docs/`).
+  - An explicit operator override: a `# CONSOLE-ACCESS-CONFIRMED` comment,
+    for the legitimate case where someone is at the console (or on a host they
+    can reach out-of-band) and genuinely needs to stop the unit. Deliberately
+    NOT inferred — console access is invisible from the command text, and
+    auto-detecting it would reopen the hole.
+
+DESIGN CONTRACT
+  - Fail OPEN on anything unexpected -> exit 0 (allow).
+  - Deny = exit 2 with the fix on stderr (Claude Code PreToolUse contract,
+    which opencode-safety-gates passes through unchanged).
+  - The denial names the safe alternative, not just the prohibition.
+"""
+
+import json
+import re
+import sys
+
+# Units whose loss takes out the session's own access to the host.
+ACCESS_CRITICAL = r"(?:sssd|sshd|ssh|NetworkManager|network|firewalld|nscd|oddjobd)"
+
+# systemctl <verb> <unit>, with optional sudo/path, optional flags, and an
+# optional `.service`/`.socket` suffix. Verbs limited to the destructive set.
+SYSTEMCTL = re.compile(
+    r"(?:^|[;&|(`\n'\"]|\$\()\s*"          # start of a command segment
+    r"(?:sudo\s+(?:-\S+\s+)*)?"            # optional sudo (+ flags)
+    r"(?:/[\w./-]*bin/)?"                  # optional absolute path
+    r"systemctl\s+"
+    r"(?:-\S+\s+)*"                        # optional systemctl flags
+    r"(?P<verb>stop|disable|mask|kill)\s+"
+    r"(?:-\S+\s+)*"
+    r"(?P<unit>" + ACCESS_CRITICAL + r")(?:\.(?:service|socket))?\b",
+    re.IGNORECASE,
+)
+
+# Other ways to take the same services down.
+OTHER_KILLS = re.compile(
+    r"(?:^|[;&|(`\n'\"]|\$\()\s*"
+    r"(?:sudo\s+(?:-\S+\s+)*)?"
+    r"(?:"
+    r"(?:/[\w./-]*bin/)?(?:pkill|killall)\s+(?:-\S+\s+)*" + ACCESS_CRITICAL + r"\b"
+    r"|"
+    r"(?:/[\w./-]*bin/)?service\s+" + ACCESS_CRITICAL + r"\s+(?:stop|kill)\b"
+    r"|"
+    r"(?:/[\w./-]*sbin/)?iptables\s+(?:-\S+\s+)*-F\b"      # flush = strand risk
+    r")",
+    re.IGNORECASE,
+)
+
+# Wiping the SSSD cache database. On its own this is survivable (SSSD refetches);
+# paired with a stop it is what made the incident unrecoverable. Denied because
+# `sss_cache -E` is the correct tool and needs no file removal at all.
+CACHE_WIPE = re.compile(
+    r"(?:^|[;&|(`\n'\"]|\$\()\s*"
+    r"(?:sudo\s+(?:-\S+\s+)*)?"
+    r"(?:/[\w./-]*bin/)?rm\s+(?:-\S+\s+)*"
+    r"\S*/var/lib/sss/db/\S*",
+    re.IGNORECASE,
+)
+
+# A single atomic restart of the SAME unit, in the SAME command segment, means
+# the service comes back without needing a second privileged call. That is the
+# sanctioned repair, so a `stop` is forgiven when a `start`/`restart` for that
+# unit appears in the same segment (e.g. `stop sssd && start sssd` is still
+# denied on the multi-step ground below, but `restart sssd` never matches at
+# all because `restart` is not in the verb list).
+RESTART_SAME_SEGMENT = re.compile(
+    r"systemctl\s+(?:-\S+\s+)*(?:restart|start)\s+(?:-\S+\s+)*(?P<unit>"
+    + ACCESS_CRITICAL + r")(?:\.(?:service|socket))?\b",
+    re.IGNORECASE,
+)
+
+# Prose/doc write that quotes the command: must be a real redirect INTO a
+# prose file, never a mere mention of a filename, or the exemption swallows
+# the rule.
+DOC_WRITE = re.compile(
+    r">>?\s*\S*(?:/memory/|/docs/|/tickets/|/runbooks/|/rules/)\S*|"
+    r">>?\s*\S+\.(?:md|markdown|txt|rst)\b"
+)
+
+# Searching FOR the string rather than running it.
+SEARCH_PATTERN = re.compile(
+    r"\b(?:rg|grep|egrep|fgrep|ag|sed|awk)\b"
+    r"(?:\s+-\S+)*\s+"
+    r"(?P<q>['\"])(?:(?!(?P=q))[^\n])*?"
+    r"(?:systemctl|pkill|killall|/var/lib/sss)"
+)
+
+# Explicit operator override. Never inferred — see module docstring.
+OVERRIDE = re.compile(
+    r"#\s*CONSOLE[-_ ]?ACCESS[-_ ]?CONFIRMED", re.IGNORECASE
+)
+
+FIX = (
+    "this command removes the access THIS session depends on.\n"
+    "  On an IPA/SSSD-enrolled host, stopping sssd takes out your own sudo\n"
+    "  (IPA-served sudo rules), your own SSH key (AuthorizedKeysCommand ->\n"
+    "  sss_ssh_authorizedkeys) and user resolution (NSS). Recovery is\n"
+    "  CONSOLE-ONLY — a channel an agent does not have.\n"
+    "\n"
+    "  Instead:\n"
+    "    - flush the cache without a restart:  sudo sss_cache -E\n"
+    "      (then WAIT — sudo/HBAC propagation is not instant; the responder\n"
+    "       refetches on its own schedule, up to ~6h on defaults)\n"
+    "    - if a bounce is genuinely required:  sudo systemctl restart sssd\n"
+    "      as ONE atomic command — never stop/.../start across steps, which\n"
+    "      cannot complete once the privilege is gone\n"
+    "    - for sshd/NetworkManager: reload where possible; a restart can\n"
+    "      strand the management address (a NIC re-activation can demote the\n"
+    "      management route while the host stays up)\n"
+    "\n"
+    "  If the host is only a VERIFICATION TARGET for some other change, it is\n"
+    "  out of scope for mutation entirely: report the disagreeing check and\n"
+    "  stop. Do not mutate a host to make a check agree with you.\n"
+    "\n"
+    "  If you are at the console or have out-of-band access and this is\n"
+    "  genuinely needed, add a `# CONSOLE-ACCESS-CONFIRMED` comment."
+)
+
+
+def _allow():
+    sys.exit(0)
+
+
+def deny(what):
+    sys.stderr.write(
+        "Blocked: %s — self-revoking command (opencode-safety-gates example gate).\nFix: %s\n"
+        % (what, FIX)
+    )
+    sys.exit(2)
+
+
+def _segment_of(command, pos):
+    """The command segment containing pos, split on shell separators."""
+    starts = [m.end() for m in re.finditer(r"[;&|\n]+", command[:pos])]
+    start = starts[-1] if starts else 0
+    nxt = re.search(r"[;&|\n]", command[pos:])
+    end = pos + nxt.start() if nxt else len(command)
+    return command[start:end]
+
+
+def _is_quoted_search(command, match):
+    return any(
+        s.start() <= match.start() <= s.end()
+        for s in SEARCH_PATTERN.finditer(command)
+    )
+
+
+def check(command):
+    # Cheap reject.
+    if not re.search(r"systemctl|pkill|killall|/var/lib/sss|iptables|\bservice\b", command):
+        return
+
+    # Whole-command exemptions: describing the command rather than running it.
+    if DOC_WRITE.search(command):
+        return
+    if OVERRIDE.search(command):
+        return
+
+    for m in SYSTEMCTL.finditer(command):
+        if _is_quoted_search(command, m):
+            continue
+        unit = m.group("unit")
+        verb = m.group("verb")
+        # A start/restart of the same unit in the same segment means the
+        # service is brought back by this very command.
+        seg = _segment_of(command, m.start())
+        if verb.lower() == "stop" and unit.lower() != "sshd":
+            if any(r.group("unit").lower() == unit.lower()
+                   for r in RESTART_SAME_SEGMENT.finditer(seg)):
+                continue
+        deny("systemctl %s %s" % (verb, unit))
+
+    for m in OTHER_KILLS.finditer(command):
+        if _is_quoted_search(command, m):
+            continue
+        deny(m.group(0).strip())
+
+    for m in CACHE_WIPE.finditer(command):
+        if _is_quoted_search(command, m):
+            continue
+        deny("rm under /var/lib/sss/db/")
+
+
+def main():
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        _allow()
+    if not raw.strip():
+        _allow()
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        _allow()
+
+    command = (data.get("tool_input") or {}).get("command")
+    if not isinstance(command, str) or not command.strip():
+        _allow()
+
+    try:
+        check(command)
+    except SystemExit:
+        raise
+    except Exception:
+        _allow()          # a bug in the gate must not wedge the shell
+    _allow()
+
+
+if __name__ == "__main__":
+    main()
