@@ -33,8 +33,10 @@ Two failure modes this plugin was built around, both from real incidents:
    CLI invocation from memory, shipped it into a doc, and later cited its own
    doc as the source. The syntax was wrong. Fabricated syntax is
    indistinguishable from correct syntax until it fails on a production
-   shell — so the gate forces verification (`--help`, man page, upstream
-   source) before a claim survives.
+   shell — so the gate sends one advisory corrective prompt per session
+   asking the model to verify (`--help`, man page, upstream source) or
+   correct the claim. It cannot block restatement; it surfaces the gap to
+   the model and the human.
 
 And one meta-lesson: **a security gate that dies silently protects no one.**
 Both real-world breakages of this plugin's private predecessor were silent —
